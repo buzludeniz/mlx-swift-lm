@@ -547,4 +547,84 @@ public class SampleTests: XCTestCase {
         let origLogits = MLXArray([1.0 as Float, 2.0 as Float])[.newAxis, .ellipsis]
         _ = chained.process(logits: origLogits)
     }
+
+    private struct AddProcessor: LogitProcessor {
+        let amount: Float
+        func prompt(_ prompt: MLXArray) {}
+        func process(logits: MLXArray) -> MLXArray { logits + amount }
+        func didSample(token: MLXArray) {}
+    }
+
+    private final class LifecycleLog {
+        var emitted: [Int] = []
+        var finalized = 0
+    }
+
+    private struct LifecycleProcessor: LogitProcessor {
+        let log: LifecycleLog
+        func prompt(_ prompt: MLXArray) {}
+        func process(logits: MLXArray) -> MLXArray { logits }
+        func didSample(token: MLXArray) {}
+        func didEmit(token: Int) { log.emitted.append(token) }
+        func finalizeGeneration() { log.finalized += 1 }
+    }
+
+    private struct ReasoningCountProcessor: LogitProcessor, GenerationReasoningTokenCounting {
+        let generationReasoningTokenCount: Int?
+        func prompt(_ prompt: MLXArray) {}
+        func process(logits: MLXArray) -> MLXArray { logits }
+        func didSample(token: MLXArray) {}
+    }
+
+    func testChainedLogitProcessorWithNoProcessorsReturnsLogitsUnchanged() {
+        let chained = ChainedLogitProcessor(processors: [])
+        let values = chained.process(logits: MLXArray([1.0, 2.0, 3.0] as [Float]))
+            .asArray(Float.self)
+
+        XCTAssertEqual(values, [1.0, 2.0, 3.0])
+    }
+
+    func testChainedLogitProcessorForwardsDidEmitAndFinalizeGeneration() {
+        let first = LifecycleLog()
+        let second = LifecycleLog()
+        var chained = ChainedLogitProcessor(processors: [
+            LifecycleProcessor(log: first),
+            LifecycleProcessor(log: second),
+        ])
+
+        chained.didEmit(token: 7)
+        chained.didEmit(token: 8)
+        chained.finalizeGeneration()
+
+        XCTAssertEqual(first.emitted, [7, 8])
+        XCTAssertEqual(second.emitted, [7, 8])
+        XCTAssertEqual(first.finalized, 1)
+        XCTAssertEqual(second.finalized, 1)
+    }
+
+    func testChainedLogitProcessorReportsNestedReasoningTokenCount() {
+        let chained = ChainedLogitProcessor(processors: [
+            AddProcessor(amount: 1),
+            ReasoningCountProcessor(generationReasoningTokenCount: 4),
+        ])
+
+        XCTAssertEqual(chained.generationReasoningTokenCount, 4)
+    }
+
+    func testChainedLogitProcessorRemovingAllRemovesMatchingNestedProcessors() {
+        let chained = ChainedLogitProcessor(processors: [
+            AddProcessor(amount: 1),
+            ChainedLogitProcessor(processors: [
+                ScaleProcessor(scale: 2),
+                AddProcessor(amount: 3),
+            ]),
+        ])
+
+        // 0 + 1 + 3, with the nested scale removed
+        let remaining = chained.removingAll { $0 is ScaleProcessor }
+        let values = remaining?.process(logits: MLXArray([0.0] as [Float])).asArray(Float.self)
+
+        XCTAssertEqual(values, [4.0])
+        XCTAssertNil(chained.removingAll { _ in true })
+    }
 }
